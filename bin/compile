@@ -1,17 +1,6 @@
-#!/usr/bin/env bash
-# bin/compile <build-dir> <cache-dir>
-# BUILD_DIR is modified between builds
-# CACHE_DIR is retained between builds
+#!/bin/bash
 
-# fail fast
-#set -e
-set -x
-
-APACHE_VERSION="2.2.22"
-PHP_VERSION="5.4.1"
-APACHE_BINARY_URL="http://projects.interlated.com.au/apache-${APACHE_VERSION}_php-${PHP_VERSION}.tar.bz2"
-APACHE_DIR=apache
-PHP_DIR=php
+BUILD_LOG=`pwd`/build.log
 
 log_action() 
 {
@@ -21,67 +10,117 @@ log_action()
 log_fail() 
 {
   do_log 'XXXXXX' "$@"
+  exit
 }
 
 do_log()
 {
   local prefix=$1
-  shift
-  echo "$prefix $@"
+  local category=$2
+  shift 2
+  echo "$prefix [${category}] $@" | tee -a $BUILD_LOG
 }
 
 CURL_FLAGS="--silent --max-time 60 --location"
 
-BIN_DIR=$(dirname $0)
-BUILD_DIR=$1
-CACHE_DIR=$2
-LP_DIR=`cd $(dirname $0); cd ..; pwd`
+LIBMCRYPT_VERSION=2.5.8 
+MCRYPT_URL=http://downloads.sourceforge.net/project/mcrypt/Libmcrypt/${LIBMCRYPT_VERSION}/libmcrypt-${LIBMCRYPT_VERSION}.tar.bz2 
+APACHE_VERSION="2.2.22"
+APACHE_URL=http://www.apache.org/dist/httpd/httpd-${APACHE_VERSION}.tar.bz2
+PHP_VERSION="5.4.1"
+PHP_URL=http://us.php.net/distributions/php-${PHP_VERSION}.tar.bz2
 
+OUTPUT="apache-${APACHE_VERSION}_php-${PHP_VERSION}"
+OUTPUT_DEVEL="${OUTPUT}_devel"
+OUTPUT_MANUAL="${OUTPUT}_manual"
+
+MCRYPT_DIR=libmcrypt-${LIBMCRYPT_VERSION}
+APACHE_DIR=httpd-${APACHE_VERSION}
+PHP_DIR=php-${PHP_VERSION}
+MCRYPT_ROOT=/app
+APACHE_ROOT=/app/apache
+PHP_ROOT=/app/php
+
+#BUILD_DIR=`mktemp -d`
+BUILD_DIR=/app/www/buildpack/temp
 pushd "$BUILD_DIR"
 
-# include .files when moving things around
-shopt -s dotglob
+log_action main "Build log file: $BUILD_LOG"
+log_action apache "Downloading apache from $APACHE_URL"
+curl $CURL_FLAGS "$APACHE_URL" | tar xj
+if [ ! -d "$APACHE_DIR" ]; then
+  log_fail "Failed to find apache directory $APACHE_DIR"
+fi 
 
-# move app things to www
-mkdir -p "${CACHE_DIR}/www"
-mv * "${CACHE_DIR}/www"
-mv "${CACHE_DIR}/www" .
+log_action mcrypt "Downloading libmcrypt from ${MCRYPT_URL}"
+curl $CURL_FLAGS "$MCRYPT_URL" | tar xj
+if [ ! -d "$MCRYPT_DIR" ]; then
+  log_fail "Failed to find mcrypt directory $MCRYPT_DIR"
+fi 
 
-# keep Procfile
-if [ -f www/Procfile ]; then
-  mv www/Procfile .
+log_action php "Downloading php from $PHP_URL"
+curl $CURL_FLAGS "$PHP_URL" | tar xj
+if [ ! -d "$PHP_DIR" ]; then
+  log_fail "Failed to find php directory $PHP_DIR"
 fi
 
-log_action "Bundling apache $APACHE_VERSION and php $PHP_VERSION from $APACHE_BINARY_URL"
-curl $CURL_FLAGS "$APACHE_BINARY_URL" | tar xj
-if [ ! -d $APACHE_DIR ] || [ ! -d $PHP_DIR ]; then
-  log_fail "Could not find $APACHE_DIR or $PHP_DIR - download may have failed"
-  log_fail "pwd listing: `ls`"
-  exit 1
-fi
+log_action apache "Building apache"
+pushd "$APACHE_DIR" >/dev/null
+./configure --prefix=$APACHE_ROOT --enable-rewrite >> $BUILD_LOG 2>&1
+make >> $BUILD_LOG 2>&1
+make install >> $BUILD_LOG 2>&1
+make DESTDIR=$BUILD_DIR install >> $BUILD_LOG 2>&1
+popd >/dev/null
+rm -rf "$APACHE_DIR"
 
-# update config files
-cp $LP_DIR/conf/httpd.conf $APACHE_DIR/conf
-cp $LP_DIR/conf/php.ini "$PHP_DIR"
+log_action mcrypt "Building mcrypt"
+pushd "$MCRYPT_DIR"  >/dev/null
+autoconf -W no-obsolete -W no-syntax >> $BUILD_LOG 2>&1
+automake >> $BUILD_LOG 2>&1
+./configure --prefix="$MCRYPT_ROOT" >> $BUILD_LOG 2>&1
+make >> $BUILD_LOG 2>&1
+make install >> $BUILD_LOG 2>&1
+make DESTDIR=$BUILD_DIR install >> $BUILD_LOG 2>&1
+popd >/dev/null
+rm -rf "$MCRYPT_DIR" 
 
-# make php available on bin
-[ -d bin ] || mkdir -p bin
-ln -s /app/php/bin/php bin/php
+log_action php "Building php"
+pushd "$PHP_DIR" >/dev/null
+./configure --prefix="$PHP_ROOT" --with-config-file-path="$PHP_ROOT" --with-apxs2=${APACHE_ROOT}/bin/apxs \
+  --with-mysql --with-pdo-mysql --with-pgsql --with-pdo-pgsql \
+  --with-iconv --with-gd --with-curl --enable-soap=shared --with-openssl \
+  --with-mcrypt="$MCRYPT_ROOT" --with-jpeg-dir=/usr \
+  --with-freetype-dir=/usr >> $BUILD_LOG 2>&1
+make >> $BUILD_LOG 2>&1
+make install >> $BUILD_LOG 2>&1
+make INSTALL_ROOT=$BUILD_DIR install >> $BUILD_LOG 2>&1
+popd >/dev/null
+rm -rf "$PHP_DIR" 
 
+pushd app >/dev/null
 
-cat >>boot.sh <<EOF
-for var in \`env|cut -f1 -d=\`; do
-  echo "PassEnv \$var" >> /app/apache/conf/httpd.conf;
-done
-touch /app/apache/logs/error_log
-touch /app/apache/logs/access_log
-tail -F /app/apache/logs/error_log &
-tail -F /app/apache/logs/access_log &
-echo "Launching apache"
-exec /app/apache/bin/httpd -DNO_DETACH
-EOF
+DEVEL_OTHER="bin apache/build share/aclocal"
+DEVEL="$DEVEL_OTHER `find . -maxdepth 2 -name include`"
 
-chmod +x boot.sh
+MANUAL_OTHER="php/php"
+MANUAL="$MANUAL_OTHER `find . -maxdepth 2 -name man -o -name manual`"
 
-# clean the cache
-rm -rf $CACHE_DIR/*
+log_action main "Creating ${BUILD_DIR}/${OUTPUT_DEVEL}.tar.bz2"
+tar cjf "${BUILD_DIR}/${OUTPUT_DEVEL}.tar.bz2" $DEVEL
+log_action main "Creating ${BUILD_DIR}/${OUTPUT_MANUAL}.tar.bz2"
+tar cjf "${BUILD_DIR}/${OUTPUT_MANUAL}.tar.bz2" $MANUAL
+rm -rf $DEVEL $MANUAL
+rmdir share
+log_action main "Creating ${BUILD_DIR}/${OUTPUT}.tar.bz2"
+tar cjf "${BUILD_DIR}/${OUTPUT}.tar.bz2" *
+popd >/dev/null
+popd
+
+mv "${BUILD_DIR}/${OUTPUT_DEVEL}.tar.bz2" \
+  "${BUILD_DIR}/${OUTPUT_MANUAL}.tar.bz2" \
+  "${BUILD_DIR}/${OUTPUT}.tar.bz2" \
+  .
+
+log_action main "Output files: `ls *.tar.bz2`"
+log_action main "DONE"
+
