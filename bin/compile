@@ -30,7 +30,8 @@ do_log()
   echo "$prefix $@"
 }
 
-CURL_FLAGS="--silent --max-time 60 --location"
+#CURL_FLAGS="--silent --max-time 60 --location"
+CURL_FLAGS="--location"
 
 BIN_DIR=$(dirname $0)
 BUILD_DIR=$1
